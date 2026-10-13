@@ -15,6 +15,8 @@
 
 import { createServerSupabase } from "../supabase";
 import { jobErrorMessage } from "./jobError";
+import { claimIdentity, settleClaim, type Settlement, type SettlementPatch } from "./claim";
+import { safeError } from "../safeError";
 import { deleteFile } from "../storage";
 import { enqueueAppJobDelivery } from "../queue/appJobsQueue";
 import { redisEnabled } from "./driver";
@@ -128,41 +130,24 @@ export async function processClaimedJob(
     job: DbJob,
     failureHooks: Readonly<Record<string, DbJobFailureHook>> = {},
 ): Promise<void> {
-    /**
-     * FENCING TOKEN. Every write below is addressed to "the job as THIS claim
-     * left it", not merely to the row id.
-     *
-     * A job whose worker went quiet past the stale threshold is reclaimed —
-     * that is the crash-recovery design, and it is also how two live runners
-     * end up holding the same job. The zombie is not necessarily dead: a paused
-     * VM, a long GC, a wedged network call can all come back. When it does, an
-     * `.eq("id", job.id)` write lands on top of whatever the current claimant
-     * has since done — marking `done` a job that is running right now, or
-     * dragging a finished job back to `pending` and running it a second time.
-     *
-     * `claimed_at` and `attempts` are both set by the claim, so together they
-     * name one specific claim of one specific row; with `status = 'running'`
-     * they let exactly one claimant finalize.
-     */
-    const fence = <T extends { eq(column: string, value: unknown): T }>(
-        query: T,
-    ): T =>
-        query
-            .eq("id", job.id)
-            .eq("status", "running")
-            .eq("attempts", job.attempts)
-            .eq("claimed_at", job.claimed_at);
+    const claim = Object.freeze(claimIdentity(job));
+    const settle = async (patch: SettlementPatch): Promise<Settlement> => {
+        const outcome = await settleClaim(db, claim, patch);
+        if (outcome.kind === "outcome_unknown") {
+            reportInfrastructureFailure(job.id, "settlement", outcome.error);
+        }
+        return outcome;
+    };
 
     const retryUntilSuccess = RETRY_UNTIL_SUCCESS_KINDS.has(job.kind);
     const handler = handlers[job.kind];
     if (!handler && !retryUntilSuccess) {
-        await fence(
-            db.from("db_jobs").update({
-                status: "failed",
-                finished_at: new Date().toISOString(),
-                last_error: `unknown job kind: ${job.kind}`,
-            }),
-        );
+        const outcome = await settle({
+            status: "failed",
+            finished_at: new Date().toISOString(),
+            last_error: `unknown job kind: ${job.kind}`,
+        });
+        if (outcome.kind !== "committed") return;
         const unknownKind = new Error(`Unknown db_jobs kind: ${job.kind}`);
         reportError(unknownKind, {
             tags: { component: "dbq", job_kind: job.kind },
@@ -178,18 +163,26 @@ export async function processClaimedJob(
         return;
     }
 
+    let execution: { ok: true; result: Record<string, unknown> | void } | { ok: false; error: unknown };
     try {
         if (!handler) throw new Error(`unknown job kind: ${job.kind}`);
-        const result = await handler(db, job);
-        await fence(
-            db.from("db_jobs").update({
-                status: "done",
-                finished_at: new Date().toISOString(),
-                last_error: null,
-                ...(result ? { result } : {}),
-            }),
-        );
-    } catch (err) {
+        execution = { ok: true, result: await handler(db, job) };
+    } catch (error) {
+        execution = { ok: false, error };
+    }
+    // A database exception here is NOT a handler failure. Never retry a
+    // possibly committed success or invoke a domain hook on its behalf.
+    if (execution.ok) {
+        await settle({
+            status: "done",
+            finished_at: new Date().toISOString(),
+            last_error: null,
+            ...(execution.result ? { result: execution.result } : {}),
+        });
+        return;
+    }
+    {
+        const err = execution.error;
         const message = jobErrorMessage(err);
         // Destructive memory operations remove version metadata only after a
         // cleanup job owns the object path. That job is the last durable
@@ -211,8 +204,7 @@ export async function processClaimedJob(
                       Date.now(),
               )
             : retryDelayMs(job.attempts);
-        await fence(
-            db.from("db_jobs").update(
+        const settlement = await settle(
                 spent
                     ? {
                           status: "failed",
@@ -232,9 +224,8 @@ export async function processClaimedJob(
                               ? { max_attempts: 2_147_483_647 }
                               : {}),
                       },
-            ),
         );
-        if (spent) {
+        if (settlement.kind === "committed" && spent) {
             const hook = failureHooks[job.kind];
             if (hook) {
                 try {
@@ -251,7 +242,7 @@ export async function processClaimedJob(
                     });
                 }
             }
-        } else if (redisEnabled()) {
+        } else if (settlement.kind === "committed" && redisEnabled()) {
             // Redeliver the retry at its backoff time so it doesn't wait for
             // the (slow, backstop-cadence) poller. Best-effort — the poller
             // covers a failed redelivery.
@@ -281,16 +272,24 @@ export async function processClaimedJob(
         const reportable = asReportableError(err, processClaimedJob);
         if (!deferred) {
             reportError(reportable, {
-                level: spent ? "error" : "warning",
+                level: spent && settlement.kind === "committed" ? "error" : "warning",
                 tags: {
                     component: "dbq",
                     job_kind: job.kind,
                     attempt: job.attempts,
                     max_attempts: job.max_attempts,
-                    terminal: spent,
+                    terminal: spent && settlement.kind === "committed",
                 },
                 extra: { job_id: job.id, dedupe_key: job.dedupe_key ?? null },
             });
+        }
+        if (settlement.kind !== "committed") {
+            // The handler failed, but no terminal/retry state was confirmed.
+            // Do not print provider/database free text on this new path.
+            console.log("[dbq] handler outcome not settled", {
+                id: job.id, outcome: settlement.kind,
+            });
+            return;
         }
         const summary = { id: job.id, kind: job.kind, attempts: job.attempts, message };
         if (deferred) {
@@ -309,6 +308,13 @@ export async function processClaimedJob(
             );
         }
     }
+}
+
+/** New infrastructure diagnostics contain categories, never dependency free text. */
+function reportInfrastructureFailure(id: string, stage: "settlement" | "dispatch", error: unknown): void {
+    const failure = new Error(`db_job_${stage}_${safeError(error).category}`);
+    reportError(failure, { tags: { component: "dbq", stage }, extra: { job_id: id } });
+    console.error("[dbq] infrastructure operation failed", { id, stage, error: failure });
 }
 
 /** One poll tick: claim a batch and run every claimed job to completion. */
@@ -345,9 +351,13 @@ export async function runDbJobTick(
     const jobs = (data ?? []) as DbJob[];
     // allSettled defensively: processClaimedJob handles its own errors, but
     // one job's unexpected rejection must never abandon the rest of a batch.
-    await Promise.allSettled(
+    const outcomes = await Promise.allSettled(
         jobs.map((job) => processClaimedJob(db, handlers, job, failureHooks)),
     );
+    outcomes.forEach((outcome, index) => {
+        if (outcome.status === "rejected")
+            reportInfrastructureFailure(jobs[index].id, "dispatch", outcome.reason);
+    });
     return jobs.length;
 }
 
