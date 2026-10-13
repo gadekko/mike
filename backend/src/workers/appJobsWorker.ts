@@ -66,6 +66,7 @@ let worker: Worker<AppJobDelivery> | null = null;
 let intake: AbortController | null = null;
 let pausing: Promise<void> | null = null;
 
+/** Validate policies before creating a Redis consumer with a generation-bound claim callback. */
 export function createAppJobsWorker(): Worker<AppJobDelivery> {
     if (worker && !intake?.signal.aborted) return worker;
     assertValidExecutionPolicies(DB_JOB_EXECUTION_POLICIES);
@@ -110,6 +111,7 @@ export function stopAppJobIntake(): void {
     });
 }
 
+/** Pause and close the captured consumer without clearing a replacement worker. */
 export async function stopAppJobsWorker(): Promise<void> {
     const current = worker;
     stopAppJobIntake();

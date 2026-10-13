@@ -21,6 +21,7 @@ class Fixture {
     readonly exit: Promise<void>;
     output = "";
     private sequence = 0;
+    /** Spawn a credential-isolated child and retain IPC/output for deterministic test barriers. */
     constructor(config: Record<string, unknown>) {
         this.child = fork(resolve("src/__tests__/fixtures/dbJobWorker.ts"), [JSON.stringify(config)], {
             execArgv: ["--import", "tsx"],
@@ -38,6 +39,7 @@ class Fixture {
         this.child.on("message", (message) => this.events.push(message as Event));
         this.exit = new Promise((resolveExit) => this.child.once("exit", () => resolveExit()));
     }
+    /** Await a matching child event and fail promptly if the process exits first. */
     async wait(event: string, predicate: (value: Event) => boolean = () => true): Promise<Event> {
         let found: Event | undefined;
         await until(() => {
@@ -47,6 +49,7 @@ class Fixture {
         });
         return found!;
     }
+    /** Correlate an IPC command with its reply while observing early rejection on cleanup. */
     command(command: string, values: Record<string, unknown> = {}): Promise<void> {
         const pending = (async () => {
             const request = ++this.sequence;
@@ -64,6 +67,7 @@ class Fixture {
         void pending.catch(() => {});
         return pending;
     }
+    /** Kill only this fixture process and await exit before deleting its database rows. */
     async kill(): Promise<void> {
         if (this.child.exitCode !== null || this.child.signalCode !== null) return;
         this.child.kill("SIGKILL");
@@ -71,6 +75,7 @@ class Fixture {
     }
 }
 
+/** Poll a real-service barrier with a finite timeout instead of assuming a fixed delay suffices. */
 async function until(predicate: () => boolean | Promise<boolean>, timeoutMs = 15_000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     while (!(await predicate())) {
@@ -83,6 +88,7 @@ suite("db_jobs real worker processes", () => {
     let db: SupabaseClient;
     const children: Fixture[] = [];
     const ids: string[] = [];
+    /** Age a fictional timestamp beyond the production lease window without a ten-minute sleep. */
     const stale = () => new Date(Date.now() - 660_000).toISOString();
     beforeAll(() => { db = createClient(url!, key!, { auth: { persistSession: false, autoRefreshToken: false } }); });
     afterEach(async () => {
@@ -92,20 +98,24 @@ suite("db_jobs real worker processes", () => {
             if (error) throw error;
         }
     });
+    /** Track a child for teardown and wait until its production modules are loaded. */
     async function child(config: Record<string, unknown>): Promise<Fixture> {
         const instance = new Fixture(config); children.push(instance);
         await instance.wait("ready"); return instance;
     }
+    /** Insert a fictional queue row and retain its ID for scoped teardown. */
     async function insert(kind: string, fields: Record<string, unknown> = {}): Promise<DbJob> {
         const { data, error } = await db.from("db_jobs").insert({ kind, payload: {}, ...fields }).select("*").single();
         if (error) throw error;
         ids.push(data.id); return data as DbJob;
     }
+    /** Read authoritative persisted job state after a process or transport barrier. */
     async function row(id: string): Promise<DbJob> {
         const { data, error } = await db.from("db_jobs").select("*").eq("id", id).single();
         if (error) throw error;
         return data as DbJob;
     }
+    /** Set explicit test preconditions, including aged lease timestamps, through real PostgREST. */
     async function update(id: string, fields: Record<string, unknown>): Promise<void> {
         const { error } = await db.from("db_jobs").update(fields).eq("id", id);
         if (error) throw error;

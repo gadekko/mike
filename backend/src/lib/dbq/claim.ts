@@ -22,6 +22,7 @@ export type SettlementPatch = {
     max_attempts?: number;
 };
 
+/** Copy the attempt fence before a handler can mutate its job object. */
 export function claimIdentity(
     job: Pick<DbJob, "id" | "attempts" | "claimed_at">,
 ): ClaimIdentity {

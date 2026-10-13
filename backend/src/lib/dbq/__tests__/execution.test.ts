@@ -6,12 +6,14 @@ const claim = Object.freeze({ id: "job-1", attempts: 2, claimedAt: "2026-10-13T0
 const job = { id: claim.id, kind: "test.synthetic", attempts: claim.attempts, claimed_at: claim.claimedAt } as DbJob;
 const policy = { heartbeatIntervalMs: 100, maxDurationMs: 30_000 };
 const success = { data: [{ id: claim.id, heartbeat_at: "2026-10-13T00:00:01Z" }], error: null };
+/** Expose a promise barrier for controlling late handler and transport completion. */
 function deferred<T>() {
     let resolve!: (value: T) => void;
     let reject!: (error: unknown) => void;
     const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
     return { promise, resolve, reject };
 }
+/** Model heartbeat responses and capture abort signals without using a live database. */
 function database(responses: Array<unknown | Promise<unknown>> = []) {
     const signals: AbortSignal[] = [];
     const rpc = vi.fn(() => ({ abortSignal(signal: AbortSignal) {

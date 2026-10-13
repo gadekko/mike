@@ -139,6 +139,7 @@ export async function processClaimedJob(
     if (policy && RETRY_UNTIL_SUCCESS_KINDS.has(job.kind))
         throw new Error("cleanup_claim_renewal_not_supported");
     const claim = Object.freeze(claimIdentity(job));
+    /** Persist once using the captured fence and report unknown writes without retrying them. */
     const settle = async (patch: SettlementPatch): Promise<Settlement> => {
         const outcome = await settleClaim(db, claim, policy ? { result: job.result, ...patch } : patch, Boolean(policy));
         if (outcome.kind === "outcome_unknown") {
@@ -469,6 +470,7 @@ type RunnerGeneration = {
 };
 let generation: RunnerGeneration | null = null;
 
+/** Respect the operational queue switch shared by producers and consumers. */
 export function dbJobsEnabled(): boolean {
     return process.env.DB_JOBS_ENABLED !== "false";
 }
@@ -491,6 +493,7 @@ export function startDbJobRunner(
     generation = current;
     const db = createServerSupabase();
     const signal = current.controller.signal;
+    /** Run at most one claim batch for this generation, respecting stop and claim backoff. */
     const tick = () => {
         if (signal.aborted || current.tick || !defaultClaimGate.ready()) return;
         current.tick = runDbJobTick(db, handlers, failureHooks, defaultClaimGate, { policies, signal })
@@ -499,6 +502,7 @@ export function startDbJobRunner(
                 console.error("[dbq] tick failed", err);
             }).finally(() => { current.tick = null; });
     };
+    /** Track one retention sweep so shutdown can await its outstanding storage work. */
     const sweep = () => {
         if (signal.aborted || current.sweep) return;
         current.sweep = runDbJobRetentionSweep(db).catch((err) => {
@@ -520,6 +524,7 @@ export function stopDbJobIntake(): void {
     generation.timers = [];
 }
 
+/** Stop intake and drain this generation without clearing a newer runner on restart. */
 export async function stopDbJobRunner(): Promise<void> {
     const current = generation;
     stopDbJobIntake();

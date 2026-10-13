@@ -10,6 +10,7 @@ export type ExecutionOutcome =
     | { kind: "failed"; error: unknown }
     | { kind: "closed"; reason: LostReason };
 
+/** Reject renewal intervals and execution budgets outside the supported timer bounds. */
 function assertValidExecutionPolicy(policy: DbJobExecutionPolicy): void {
     if (!Number.isFinite(policy.heartbeatIntervalMs) || policy.heartbeatIntervalMs <= 0 ||
         policy.heartbeatIntervalMs > CLAIM_STALE_SECONDS * 1000 / 3 ||
@@ -49,6 +50,7 @@ export async function executeWithClaim(
     let resolveClosed!: (outcome: ExecutionOutcome) => void;
     const closed = new Promise<ExecutionOutcome>((resolve) => { resolveClosed = resolve; });
 
+    /** Irreversibly abort local work and renewal without releasing the database claim. */
     const close = (why: LostReason) => {
         if (reason) return;
         reason = why;
@@ -57,17 +59,20 @@ export async function executeWithClaim(
         request?.abort();
         resolveClosed({ kind: "closed", reason: why });
     };
+    /** Recheck monotonic deadline and shutdown even when event-loop timers ran late. */
     const current = () => {
         if (!reason && performance.now() >= expires) close("deadline");
         if (!reason && parentSignal?.aborted) close("shutdown");
         return !reason;
     };
+    /** Close this execution when its owning worker generation stops intake. */
     const onShutdown = () => close("shutdown");
     parentSignal?.addEventListener("abort", onShutdown, { once: true });
 
     // assertOwnership and scheduled renewals share the same request. Even an
     // abort-ignoring transport is bounded locally; a late response cannot reopen
     // the controller. An uncertain heartbeat is left to expire in PostgreSQL.
+    /** Share one bounded heartbeat RPC; uncertainty closes the execution permanently. */
     const renew = (): Promise<boolean> => {
         if (finishing || !current()) return Promise.resolve(false);
         if (inFlight) return inFlight;
@@ -108,6 +113,7 @@ export async function executeWithClaim(
         })().finally(() => { inFlight = undefined; });
         return inFlight;
     };
+    /** Schedule the next heartbeat only after the preceding request has completed. */
     const schedule = () => {
         if (finishing || !current()) return;
         heartbeat = setTimeout(() => {

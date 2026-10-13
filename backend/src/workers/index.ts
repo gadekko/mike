@@ -22,10 +22,12 @@ export function startWorkers(): void {
     }
 }
 
+/** Close app-job claim intake synchronously before any worker drain is awaited. */
 export function stopWorkerIntake(): void {
     stopAppJobIntake();
 }
 
+/** Await every worker and resource closure before propagating aggregate shutdown failures. */
 export async function stopWorkers(): Promise<void> {
     stopWorkerIntake();
     const stops = await Promise.allSettled(WORKER_REGISTRY.map((w) => w.stop()));

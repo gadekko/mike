@@ -21,6 +21,7 @@ maybeDescribe("db_jobs claim SQL", () => {
     let db: SupabaseClient;
     const created: string[] = [];
 
+    /** Create a fictional queue row and register its ID for teardown. */
     const insertJob = async (row: Record<string, unknown>) => {
         const { data, error } = await db
             .from("db_jobs")
@@ -32,6 +33,7 @@ maybeDescribe("db_jobs claim SQL", () => {
         return data as Record<string, unknown>;
     };
 
+    /** Exercise the production batch claim RPC with a test-kind filter. */
     const claimBatch = async (limit = 10) => {
         const { data, error } = await db.rpc("claim_db_jobs", {
             p_limit: limit,
@@ -42,6 +44,7 @@ maybeDescribe("db_jobs claim SQL", () => {
         return (data ?? []) as Record<string, unknown>[];
     };
 
+    /** Read persisted state independently of the claim or settlement response. */
     const reload = async (id: string) => {
         const { data, error } = await db
             .from("db_jobs")

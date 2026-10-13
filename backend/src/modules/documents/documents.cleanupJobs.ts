@@ -27,6 +27,7 @@ type ClaimedCleanupJob = Pick<
   "id" | "payload" | "attempts" | "claimed_at"
 >;
 
+/** Deduplicate valid storage keys while ignoring malformed entries in a cleanup payload. */
 function cleanupKeys(payload: DbJob["payload"] | undefined): string[] {
   const raw = payload?.keys;
   return [
