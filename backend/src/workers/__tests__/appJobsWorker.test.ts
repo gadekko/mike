@@ -47,6 +47,7 @@ const CLAIMED: DbJob = {
     max_attempts: 3,
     run_at: "",
     claimed_at: "2026-10-13T00:00:00Z",
+    heartbeat_at: null,
     finished_at: null,
     last_error: null,
     dedupe_key: null,

@@ -49,6 +49,7 @@ const JOB = (over: Partial<DbJob> = {}): DbJob => ({
     max_attempts: 3,
     run_at: "2026-08-21T00:00:00Z",
     claimed_at: "2026-08-21T00:00:01Z",
+    heartbeat_at: null,
     finished_at: null,
     last_error: null,
     dedupe_key: null,
