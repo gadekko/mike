@@ -461,64 +461,68 @@ export async function runDbJobRetentionSweep(
         .lt("created_at", doneCutoff);
 }
 
-let pollTimer: ReturnType<typeof setInterval> | null = null;
-let sweepTimer: ReturnType<typeof setInterval> | null = null;
-let inFlight: Promise<unknown> | null = null;
+type RunnerGeneration = {
+    controller: AbortController;
+    timers: ReturnType<typeof setTimeout>[];
+    tick: Promise<unknown> | null;
+    sweep: Promise<unknown> | null;
+};
+let generation: RunnerGeneration | null = null;
 
 export function dbJobsEnabled(): boolean {
     return process.env.DB_JOBS_ENABLED !== "false";
 }
 
-/**
- * Start the poll loop (idempotent). Ticks never overlap: a tick that is
- * still running when the next interval fires simply skips that interval.
- */
-export function startDbJobRunner(handlers: DbJobHandlers, failureHooks: Readonly<Record<string, DbJobFailureHook>> = {}, policies: import("./types").DbJobExecutionPolicies = {}): void {
+/** Each start owns its timers and signal; an older drain cannot stop a restart. */
+export function startDbJobRunner(
+    handlers: DbJobHandlers,
+    failureHooks: Readonly<Record<string, DbJobFailureHook>> = {},
+    policies: DbJobExecutionPolicies = {},
+): void {
     if (!dbJobsEnabled()) {
         console.log("[dbq] disabled via DB_JOBS_ENABLED=false");
         return;
     }
-    if (pollTimer) return;
+    if (generation && !generation.controller.signal.aborted) return;
+    const current: RunnerGeneration = {
+        controller: new AbortController(), timers: [], tick: null, sweep: null,
+    };
+    generation = current;
     const db = createServerSupabase();
-
+    const signal = current.controller.signal;
     const tick = () => {
-        // While claims keep failing, skip ticks until the backed-off retry
-        // time instead of hitting the broken dependency every interval.
-        if (inFlight || !defaultClaimGate.ready()) return;
-        inFlight = runDbJobTick(db, handlers, failureHooks, defaultClaimGate, { policies })
+        if (signal.aborted || current.tick || !defaultClaimGate.ready()) return;
+        current.tick = runDbJobTick(db, handlers, failureHooks, defaultClaimGate, { policies, signal })
             .catch((err) => {
                 reportError(err, { tags: { component: "dbq", stage: "tick" } });
                 console.error("[dbq] tick failed", err);
-            })
-            .finally(() => {
-                inFlight = null;
-            });
+            }).finally(() => { current.tick = null; });
     };
-    pollTimer = setInterval(tick, pollMs());
-    pollTimer.unref();
-    // First tick shortly after boot so work queued before a restart resumes
-    // without waiting a full interval.
-    setTimeout(tick, 1_000).unref();
-
-    const sweep = () =>
-        void runDbJobRetentionSweep(db).catch((err) => {
+    const sweep = () => {
+        if (signal.aborted || current.sweep) return;
+        current.sweep = runDbJobRetentionSweep(db).catch((err) => {
             reportError(err, { tags: { component: "dbq", stage: "retention" } });
             console.error("[dbq] retention sweep failed", err);
-        });
-    sweepTimer = setInterval(sweep, SWEEP_EVERY_MS);
-    sweepTimer.unref();
-    setTimeout(sweep, 60_000).unref();
-
-    console.log(
-        `[dbq] runner started (poll ${pollMs()}ms, driver ${redisEnabled() ? "redis" : "postgres"})`,
-    );
+        }).finally(() => { current.sweep = null; });
+    };
+    current.timers = [setInterval(tick, pollMs()), setTimeout(tick, 1_000),
+        setInterval(sweep, SWEEP_EVERY_MS), setTimeout(sweep, 60_000)];
+    current.timers.forEach((timer) => timer.unref());
+    console.log(`[dbq] runner started (poll ${pollMs()}ms, driver ${redisEnabled() ? "redis" : "postgres"})`);
 }
 
-/** Stop polling and wait for the in-flight tick to finish (shutdown path). */
+/** Close intake synchronously, before waiting for any other worker to drain. */
+export function stopDbJobIntake(): void {
+    if (!generation) return;
+    generation.controller.abort();
+    generation.timers.forEach(clearTimeout);
+    generation.timers = [];
+}
+
 export async function stopDbJobRunner(): Promise<void> {
-    if (pollTimer) clearInterval(pollTimer);
-    if (sweepTimer) clearInterval(sweepTimer);
-    pollTimer = null;
-    sweepTimer = null;
-    if (inFlight) await inFlight;
+    const current = generation;
+    stopDbJobIntake();
+    if (!current) return;
+    await Promise.allSettled([current.tick, current.sweep]);
+    if (generation === current) generation = null;
 }

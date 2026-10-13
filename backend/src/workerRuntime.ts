@@ -13,8 +13,8 @@
 // Contents: the BullMQ workers (driver-gated), the DB-queue runner, the
 // stale-work reaper, and the workflow catalog boot sync.
 
-import { anyWorkerEnabled, startWorkers, stopWorkers } from "./workers";
-import { startDbJobRunner, stopDbJobRunner } from "./lib/dbq/runner";
+import { anyWorkerEnabled, startWorkers, stopWorkers, stopWorkerIntake } from "./workers";
+import { startDbJobRunner, stopDbJobRunner, stopDbJobIntake } from "./lib/dbq/runner";
 import {
     DB_JOB_HANDLERS,
     DB_JOB_FAILURE_HOOKS,
@@ -80,10 +80,11 @@ async function runMcpTokenRefreshSweep(): Promise<void> {
     }
 }
 let started = false;
+let stopping: Promise<void> | null = null;
 
 /** Start every background worker (idempotent). */
 export function startAllWorkers(): void {
-    if (started) return;
+    if (started || stopping) return;
     started = true;
 
     // BullMQ workers: conversion/extraction when their flags are on, plus
@@ -138,7 +139,10 @@ export function startAllWorkers(): void {
 }
 
 /** Stop everything gracefully; safe to call more than once. */
-export async function stopAllWorkers(): Promise<void> {
+export function stopAllWorkers(): Promise<void> {
+    if (stopping) return stopping;
+    stopDbJobIntake();
+    stopWorkerIntake();
     if (initialSweep) clearTimeout(initialSweep);
     if (sweepTimer) clearInterval(sweepTimer);
     if (mcpRefreshTimer) clearInterval(mcpRefreshTimer);
@@ -149,7 +153,12 @@ export async function stopAllWorkers(): Promise<void> {
         stopUploadWorker();
         stopUploadWorker = null;
     }
-    await stopWorkers();
-    await stopDbJobRunner();
-    started = false;
+    stopping = Promise.allSettled([stopWorkers(), stopDbJobRunner()]).then((results) => {
+        const failure = results.find((result) => result.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
+    }).finally(() => {
+        started = false;
+        stopping = null;
+    });
+    return stopping;
 }

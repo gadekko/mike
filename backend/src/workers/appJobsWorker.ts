@@ -1,6 +1,7 @@
 import { Worker, type Job } from "bullmq";
 import { getRedisConnection } from "../lib/queue/connection";
 import { reportError } from "../lib/observability/sentry";
+import { safeError } from "../lib/safeError";
 import { asReportableError } from "../lib/httpError";
 import {
     APP_JOBS_QUEUE,
@@ -27,11 +28,14 @@ import type { Db, DbJob } from "../lib/dbq/types";
 export async function runAppJobDelivery(
     data: AppJobDelivery,
     db: Db = createServerSupabase(),
+    signal?: AbortSignal,
 ): Promise<void> {
+    if (signal?.aborted) return;
     const { data: rows, error } = await db.rpc("claim_db_job", {
         p_id: data.dbJobId,
         p_stale_seconds: STALE_SECONDS,
     });
+    if (signal?.aborted) return; // A late claim stays recoverable by expiry.
     if (error) {
         // Claim failure (transient DB trouble): do nothing — the row is
         // untouched and the poll backstop will claim it. Reported with its
@@ -52,17 +56,24 @@ export async function runAppJobDelivery(
     }
     const job = ((rows ?? []) as DbJob[])[0];
     if (!job) return; // already claimed/finished elsewhere, or not yet due
-    await processClaimedJob(db, DB_JOB_HANDLERS, job, DB_JOB_FAILURE_HOOKS, { policies: DB_JOB_EXECUTION_POLICIES });
+    await processClaimedJob(db, DB_JOB_HANDLERS, job, DB_JOB_FAILURE_HOOKS, {
+        policies: DB_JOB_EXECUTION_POLICIES, signal,
+    });
 }
 
 let worker: Worker<AppJobDelivery> | null = null;
+let intake: AbortController | null = null;
+let pausing: Promise<void> | null = null;
 
 export function createAppJobsWorker(): Worker<AppJobDelivery> {
-    if (worker) return worker;
+    if (worker && !intake?.signal.aborted) return worker;
+    const controller = new AbortController();
+    intake = controller;
+    pausing = null;
     worker = new Worker<AppJobDelivery>(
         APP_JOBS_QUEUE,
         async (job: Job<AppJobDelivery>) => {
-            await runAppJobDelivery(job.data);
+            await runAppJobDelivery(job.data, undefined, controller.signal);
         },
         {
             connection: getRedisConnection(),
@@ -86,9 +97,25 @@ export function createAppJobsWorker(): Worker<AppJobDelivery> {
     return worker;
 }
 
+/** Abort is synchronous even if BullMQ takes time to pause its fetch loop. */
+export function stopAppJobIntake(): void {
+    if (!worker || intake?.signal.aborted) return;
+    intake?.abort();
+    pausing = worker.pause(true).catch((error) => {
+        reportError(new Error(`app_job_pause_${safeError(error).category}`), {
+            tags: { component: "app-jobs", stage: "pause" },
+        });
+    });
+}
+
 export async function stopAppJobsWorker(): Promise<void> {
-    if (worker) {
-        await worker.close();
+    const current = worker;
+    stopAppJobIntake();
+    await pausing;
+    if (current) await current.close();
+    if (worker === current) {
         worker = null;
+        intake = null;
+        pausing = null;
     }
 }
