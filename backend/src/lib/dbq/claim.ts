@@ -33,15 +33,24 @@ export async function settleClaim(
     db: Db,
     claim: ClaimIdentity,
     patch: SettlementPatch,
+    requireLiveLease = false,
 ): Promise<Settlement> {
     if (!claim.claimedAt) return { kind: "ownership_lost" };
     try {
-        const { data, error } = await db.from("db_jobs").update(patch)
+        const query = requireLiveLease
+            ? db.rpc("settle_live_db_job", {
+                p_id: claim.id, p_attempts: claim.attempts, p_claimed_at: claim.claimedAt,
+                p_outcome: patch.status, p_result: patch.result ?? null,
+                p_last_error: patch.last_error, p_run_at: patch.run_at ?? null,
+                p_refund_attempt: patch.attempts === claim.attempts - 1,
+            })
+            : db.from("db_jobs").update(patch)
             .eq("id", claim.id)
             .eq("status", "running")
             .eq("attempts", claim.attempts)
             .eq("claimed_at", claim.claimedAt)
             .select("id");
+        const { data, error } = await query;
         if (error) return { kind: "outcome_unknown", error };
         if (Array.isArray(data) && data.length === 1 && data[0].id === claim.id)
             return { kind: "committed" };

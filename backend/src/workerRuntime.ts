@@ -18,6 +18,7 @@ import { startDbJobRunner, stopDbJobRunner } from "./lib/dbq/runner";
 import {
     DB_JOB_HANDLERS,
     DB_JOB_FAILURE_HOOKS,
+    DB_JOB_EXECUTION_POLICIES,
     MCP_TOKEN_REFRESH_WINDOW_MS,
 } from "./jobs/registry";
 import { enqueueDbJob } from "./lib/dbq/enqueue";
@@ -94,7 +95,7 @@ export function startAllWorkers(): void {
 
     // The DB queue runs in every deployment (fast delivery when Redis is
     // up, poll-driven otherwise) — see lib/dbq/runner.ts.
-    startDbJobRunner(DB_JOB_HANDLERS, DB_JOB_FAILURE_HOOKS);
+    startDbJobRunner(DB_JOB_HANDLERS, DB_JOB_FAILURE_HOOKS, DB_JOB_EXECUTION_POLICIES);
 
     // Upload-session processing: lease-based claims over Postgres, so any
     // number of runtimes can poll concurrently without double-processing.

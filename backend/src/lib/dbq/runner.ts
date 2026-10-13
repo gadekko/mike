@@ -16,6 +16,7 @@
 import { createServerSupabase } from "../supabase";
 import { jobErrorMessage } from "./jobError";
 import { claimIdentity, settleClaim, type Settlement, type SettlementPatch } from "./claim";
+import { executeWithClaim, CLAIM_STALE_SECONDS } from "./execution";
 import { safeError } from "../safeError";
 import { deleteFile } from "../storage";
 import { enqueueAppJobDelivery } from "../queue/appJobsQueue";
@@ -25,6 +26,8 @@ import {
     type Db,
     type DbJob,
     type DbJobHandlers,
+    type DbJobExecutionOptions,
+    type DbJobExecutionPolicies,
 } from "./types";
 import { reportError } from "../observability/sentry";
 import {
@@ -70,7 +73,7 @@ const CLAIM_BATCH = 5;
  * document.cleanup coalescer) has to use the same stale threshold this loop
  * does, or the two disagree about who owns a row.
  */
-export const STALE_SECONDS = 600;
+export const STALE_SECONDS = CLAIM_STALE_SECONDS;
 /** Retention: how long finished rows are kept for inspection. */
 const DONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const FAILED_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -129,10 +132,15 @@ export async function processClaimedJob(
     handlers: DbJobHandlers,
     job: DbJob,
     failureHooks: Readonly<Record<string, DbJobFailureHook>> = {},
+    options: DbJobExecutionOptions = {},
 ): Promise<void> {
+    if (options.signal?.aborted) return;
+    const policy = options.policies?.[job.kind];
+    if (policy && RETRY_UNTIL_SUCCESS_KINDS.has(job.kind))
+        throw new Error("cleanup_claim_renewal_not_supported");
     const claim = Object.freeze(claimIdentity(job));
     const settle = async (patch: SettlementPatch): Promise<Settlement> => {
-        const outcome = await settleClaim(db, claim, patch);
+        const outcome = await settleClaim(db, claim, policy ? { result: job.result, ...patch } : patch, Boolean(policy));
         if (outcome.kind === "outcome_unknown") {
             reportInfrastructureFailure(job.id, "settlement", outcome.error);
         }
@@ -164,11 +172,22 @@ export async function processClaimedJob(
     }
 
     let execution: { ok: true; result: Record<string, unknown> | void } | { ok: false; error: unknown };
-    try {
-        if (!handler) throw new Error(`unknown job kind: ${job.kind}`);
-        execution = { ok: true, result: await handler(db, job) };
-    } catch (error) {
-        execution = { ok: false, error };
+    if (policy && handler) {
+        const outcome = await executeWithClaim(db, job, claim, handler, policy, options.signal);
+        if (outcome.kind === "closed") {
+            console.log("[dbq] execution closed", { id: claim.id, reason: outcome.reason });
+            return;
+        }
+        execution = outcome.kind === "completed"
+            ? { ok: true, result: outcome.result }
+            : { ok: false, error: outcome.error };
+    } else {
+        try {
+            if (!handler) throw new Error(`unknown job kind: ${job.kind}`);
+            execution = { ok: true, result: await handler(db, job) };
+        } catch (error) {
+            execution = { ok: false, error };
+        }
     }
     // A database exception here is NOT a handler failure. Never retry a
     // possibly committed success or invoke a domain hook on its behalf.
@@ -323,7 +342,9 @@ export async function runDbJobTick(
     handlers: DbJobHandlers,
     failureHooks: Readonly<Record<string, DbJobFailureHook>> = {},
     claimGate: PollFailureGate = defaultClaimGate,
+    options: DbJobExecutionOptions = {},
 ): Promise<number> {
+    if (options.signal?.aborted) return 0;
     const { data, error } = await db.rpc("claim_db_jobs", {
         p_limit: CLAIM_BATCH,
         p_stale_seconds: STALE_SECONDS,
@@ -348,11 +369,12 @@ export async function runDbJobTick(
         return 0;
     }
     claimGate.success();
+    if (options.signal?.aborted) return 0;
     const jobs = (data ?? []) as DbJob[];
     // allSettled defensively: processClaimedJob handles its own errors, but
     // one job's unexpected rejection must never abandon the rest of a batch.
     const outcomes = await Promise.allSettled(
-        jobs.map((job) => processClaimedJob(db, handlers, job, failureHooks)),
+        jobs.map((job) => processClaimedJob(db, handlers, job, failureHooks, options)),
     );
     outcomes.forEach((outcome, index) => {
         if (outcome.status === "rejected")
@@ -451,7 +473,7 @@ export function dbJobsEnabled(): boolean {
  * Start the poll loop (idempotent). Ticks never overlap: a tick that is
  * still running when the next interval fires simply skips that interval.
  */
-export function startDbJobRunner(handlers: DbJobHandlers, failureHooks: Readonly<Record<string, DbJobFailureHook>> = {}): void {
+export function startDbJobRunner(handlers: DbJobHandlers, failureHooks: Readonly<Record<string, DbJobFailureHook>> = {}, policies: import("./types").DbJobExecutionPolicies = {}): void {
     if (!dbJobsEnabled()) {
         console.log("[dbq] disabled via DB_JOBS_ENABLED=false");
         return;
@@ -463,7 +485,7 @@ export function startDbJobRunner(handlers: DbJobHandlers, failureHooks: Readonly
         // While claims keep failing, skip ticks until the backed-off retry
         // time instead of hitting the broken dependency every interval.
         if (inFlight || !defaultClaimGate.ready()) return;
-        inFlight = runDbJobTick(db, handlers, failureHooks)
+        inFlight = runDbJobTick(db, handlers, failureHooks, defaultClaimGate, { policies })
             .catch((err) => {
                 reportError(err, { tags: { component: "dbq", stage: "tick" } });
                 console.error("[dbq] tick failed", err);

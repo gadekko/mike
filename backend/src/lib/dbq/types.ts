@@ -1,3 +1,4 @@
+import type { ClaimIdentity } from "./claim";
 import type { Db } from "../supabase";
 export type { Db };
 
@@ -39,6 +40,25 @@ export class DbJobDeferredError extends Error {
 export type DbJobHandler = (
     db: Db,
     job: DbJob,
+    context?: DbJobExecutionContext,
 ) => Promise<Record<string, unknown> | void>;
 
 export type DbJobHandlers = Record<string, DbJobHandler>;
+
+/** Explicit adoption only; existing handlers keep their current lifetime. */
+export interface DbJobExecutionPolicy {
+    heartbeatIntervalMs: number;
+    maxDurationMs: number;
+}
+export type DbJobExecutionPolicies = Readonly<Record<string, DbJobExecutionPolicy>>;
+export interface DbJobExecutionOptions {
+    policies?: DbJobExecutionPolicies;
+    signal?: AbortSignal;
+}
+export interface DbJobExecutionContext {
+    readonly claim: Readonly<ClaimIdentity>;
+    readonly signal: AbortSignal;
+    readonly deadlineAt: number;
+    remainingMs(): number;
+    assertOwnership(): Promise<void>;
+}

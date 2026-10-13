@@ -6,8 +6,8 @@ import {
     APP_JOBS_QUEUE,
     type AppJobDelivery,
 } from "../lib/queue/appJobsQueue";
-import { processClaimedJob } from "../lib/dbq/runner";
-import { DB_JOB_HANDLERS, DB_JOB_FAILURE_HOOKS } from "../jobs/registry";
+import { processClaimedJob, STALE_SECONDS } from "../lib/dbq/runner";
+import { DB_JOB_HANDLERS, DB_JOB_FAILURE_HOOKS, DB_JOB_EXECUTION_POLICIES } from "../jobs/registry";
 import { createServerSupabase } from "../lib/supabase";
 import type { Db, DbJob } from "../lib/dbq/types";
 
@@ -30,7 +30,7 @@ export async function runAppJobDelivery(
 ): Promise<void> {
     const { data: rows, error } = await db.rpc("claim_db_job", {
         p_id: data.dbJobId,
-        p_stale_seconds: 600,
+        p_stale_seconds: STALE_SECONDS,
     });
     if (error) {
         // Claim failure (transient DB trouble): do nothing — the row is
@@ -52,7 +52,7 @@ export async function runAppJobDelivery(
     }
     const job = ((rows ?? []) as DbJob[])[0];
     if (!job) return; // already claimed/finished elsewhere, or not yet due
-    await processClaimedJob(db, DB_JOB_HANDLERS, job, DB_JOB_FAILURE_HOOKS);
+    await processClaimedJob(db, DB_JOB_HANDLERS, job, DB_JOB_FAILURE_HOOKS, { policies: DB_JOB_EXECUTION_POLICIES });
 }
 
 let worker: Worker<AppJobDelivery> | null = null;
