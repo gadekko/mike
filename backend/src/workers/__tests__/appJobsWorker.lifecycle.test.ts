@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({ callbacks: [] as ((job: {data: {dbJobId: string}}) => Promise<void>)[],
-    rpc: vi.fn(), process: vi.fn(), report: vi.fn(), pause: vi.fn(async () => {}), close: vi.fn(async () => {}) }));
+    policies: {} as Record<string, {heartbeatIntervalMs: number; maxDurationMs: number}>, rpc: vi.fn(), process: vi.fn(), report: vi.fn(), pause: vi.fn(async () => {}), close: vi.fn(async () => {}) }));
 vi.mock("bullmq", () => ({ Worker: class {
     constructor(_queue: unknown, callback: (job: {data: {dbJobId: string}}) => Promise<void>) { state.callbacks.push(callback); }
     on() {} pause = state.pause; close = state.close;
@@ -8,11 +8,25 @@ vi.mock("bullmq", () => ({ Worker: class {
 vi.mock("../../lib/supabase", () => ({ createServerSupabase: () => ({ rpc: state.rpc }) }));
 vi.mock("../../lib/queue/connection", () => ({ getRedisConnection: () => ({}) }));
 vi.mock("../../lib/dbq/runner", () => ({ processClaimedJob: state.process, STALE_SECONDS: 600 }));
-vi.mock("../../jobs/registry", () => ({ DB_JOB_HANDLERS: {}, DB_JOB_FAILURE_HOOKS: {}, DB_JOB_EXECUTION_POLICIES: {} }));
+vi.mock("../../jobs/registry", () => ({ DB_JOB_HANDLERS: {}, DB_JOB_FAILURE_HOOKS: {}, DB_JOB_EXECUTION_POLICIES: state.policies }));
 vi.mock("../../lib/observability/sentry", () => ({ reportError: state.report }));
 import { createAppJobsWorker, runAppJobDelivery, stopAppJobIntake, stopAppJobsWorker } from "../appJobsWorker";
-afterEach(async () => { await stopAppJobsWorker(); vi.clearAllMocks(); state.callbacks.length = 0; });
+afterEach(async () => { await stopAppJobsWorker(); Object.keys(state.policies).forEach((key) => delete state.policies[key]); vi.clearAllMocks(); state.callbacks.length = 0; });
 describe("Redis claim intake lifecycle", () => {
+    it.each([
+        ["fixture", { heartbeatIntervalMs: 0, maxDurationMs: 1000 }],
+        ["fixture", { heartbeatIntervalMs: 100, maxDurationMs: Infinity }],
+        ["storage.cleanup", { heartbeatIntervalMs: 100, maxDurationMs: 1000 }],
+        ["document.cleanup", { heartbeatIntervalMs: 100, maxDurationMs: 1000 }],
+    ] as const)("rejects invalid %s policy before creating a consumer", (kind, policy) => {
+        state.policies[kind] = policy;
+        expect(() => createAppJobsWorker()).toThrow();
+        expect(state.callbacks).toHaveLength(0);
+        expect(state.rpc).not.toHaveBeenCalled();
+        delete state.policies[kind];
+        createAppJobsWorker();
+        expect(state.callbacks).toHaveLength(1);
+    });
     it("suppresses new claims after stop and old callbacks after restart", async () => {
         createAppJobsWorker();
         const oldCallback = state.callbacks[0];

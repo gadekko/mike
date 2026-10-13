@@ -18,6 +18,21 @@ afterEach(async () => {
     vi.unstubAllEnvs();
 });
 describe("DB runner intake lifecycle", () => {
+    it.each([
+        ["fixture", { heartbeatIntervalMs: 0, maxDurationMs: 1000 }],
+        ["fixture", { heartbeatIntervalMs: 100, maxDurationMs: Infinity }],
+        ["storage.cleanup", { heartbeatIntervalMs: 100, maxDurationMs: 1000 }],
+        ["document.cleanup", { heartbeatIntervalMs: 100, maxDurationMs: 1000 }],
+    ] as const)("rejects invalid %s policy before scheduling or claiming", async (kind, policy) => {
+        expect(() => startDbJobRunner({}, {}, { [kind]: policy })).toThrow();
+        expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(mock.rpc).not.toHaveBeenCalled();
+        // A failed start must not poison the next deliberate start.
+        startDbJobRunner({});
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(mock.rpc).toHaveBeenCalledTimes(1);
+    });
     it("cancels both delayed startup callbacks before they can query", async () => {
         startDbJobRunner({});
         stopDbJobIntake();

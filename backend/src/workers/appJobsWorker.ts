@@ -7,6 +7,7 @@ import {
     APP_JOBS_QUEUE,
     type AppJobDelivery,
 } from "../lib/queue/appJobsQueue";
+import { assertValidExecutionPolicies } from "../lib/dbq/execution";
 import { processClaimedJob, STALE_SECONDS } from "../lib/dbq/runner";
 import { DB_JOB_HANDLERS, DB_JOB_FAILURE_HOOKS, DB_JOB_EXECUTION_POLICIES } from "../jobs/registry";
 import { createServerSupabase } from "../lib/supabase";
@@ -67,6 +68,7 @@ let pausing: Promise<void> | null = null;
 
 export function createAppJobsWorker(): Worker<AppJobDelivery> {
     if (worker && !intake?.signal.aborted) return worker;
+    assertValidExecutionPolicies(DB_JOB_EXECUTION_POLICIES);
     const controller = new AbortController();
     intake = controller;
     pausing = null;

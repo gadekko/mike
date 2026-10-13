@@ -1,6 +1,6 @@
 import { performance } from "node:perf_hooks";
 import type { ClaimIdentity } from "./claim";
-import type { Db, DbJob, DbJobHandler, DbJobExecutionContext, DbJobExecutionPolicy } from "./types";
+import type { Db, DbJob, DbJobHandler, DbJobExecutionContext, DbJobExecutionPolicy, DbJobExecutionPolicies } from "./types";
 
 export const CLAIM_STALE_SECONDS = 600;
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -9,6 +9,23 @@ export type ExecutionOutcome =
     | { kind: "completed"; result: Record<string, unknown> | void }
     | { kind: "failed"; error: unknown }
     | { kind: "closed"; reason: LostReason };
+
+function assertValidExecutionPolicy(policy: DbJobExecutionPolicy): void {
+    if (!Number.isFinite(policy.heartbeatIntervalMs) || policy.heartbeatIntervalMs <= 0 ||
+        policy.heartbeatIntervalMs > CLAIM_STALE_SECONDS * 1000 / 3 ||
+        !Number.isFinite(policy.maxDurationMs) || policy.maxDurationMs <= 0 ||
+        policy.maxDurationMs > 2_147_483_647)
+        throw new Error("invalid_db_job_execution_policy");
+}
+
+/** Reject configuration before intake can consume a durable attempt. */
+export function assertValidExecutionPolicies(policies: DbJobExecutionPolicies): void {
+    for (const [kind, policy] of Object.entries(policies)) {
+        if (kind === "storage.cleanup" || kind === "document.cleanup")
+            throw new Error("cleanup_claim_renewal_not_supported");
+        assertValidExecutionPolicy(policy);
+    }
+}
 
 /** A cooperative execution lease, not a sandbox or an external-effect fence. */
 export async function executeWithClaim(
@@ -19,11 +36,7 @@ export async function executeWithClaim(
     policy: DbJobExecutionPolicy,
     parentSignal?: AbortSignal,
 ): Promise<ExecutionOutcome> {
-    if (!Number.isFinite(policy.heartbeatIntervalMs) || policy.heartbeatIntervalMs <= 0 ||
-        policy.heartbeatIntervalMs > CLAIM_STALE_SECONDS * 1000 / 3 ||
-        !Number.isFinite(policy.maxDurationMs) || policy.maxDurationMs <= 0 ||
-        policy.maxDurationMs > 2_147_483_647)
-        throw new Error("invalid_db_job_execution_policy");
+    assertValidExecutionPolicy(policy);
 
     const owner = new AbortController();
     const expires = performance.now() + policy.maxDurationMs;

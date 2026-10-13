@@ -16,7 +16,7 @@
 import { createServerSupabase } from "../supabase";
 import { jobErrorMessage } from "./jobError";
 import { claimIdentity, settleClaim, type Settlement, type SettlementPatch } from "./claim";
-import { executeWithClaim, CLAIM_STALE_SECONDS } from "./execution";
+import { executeWithClaim, CLAIM_STALE_SECONDS, assertValidExecutionPolicies } from "./execution";
 import { safeError } from "../safeError";
 import { deleteFile } from "../storage";
 import { enqueueAppJobDelivery } from "../queue/appJobsQueue";
@@ -484,6 +484,7 @@ export function startDbJobRunner(
         return;
     }
     if (generation && !generation.controller.signal.aborted) return;
+    assertValidExecutionPolicies(policies);
     const current: RunnerGeneration = {
         controller: new AbortController(), timers: [], tick: null, sweep: null,
     };
